@@ -787,10 +787,11 @@ draftResultView.clear();
 
 let cachedRecipes = [];
 
-// ----- 炉次详情的请求编排状态（防止切换炉次时响应串用）-----
+// ----- 炉次详情的请求编排状态（防止切换炉次 / 切走再返回时响应串用）-----
 // 只有“当前选择的最新有效请求”允许改写详情/曲线/提示/按钮。
 let viewedDraft = null; // 最近一次成功读回的炉次（归档按钮据此判定资格）
-let detailSeq = 0; // 详情 GET 的代际：每次查看/刷新 +1，旧请求一律作废
+let detailSeq = 0; // 查看/刷新的代际：每次 openDraft +1；归档回包也按点击时
+                   // 代际归位，切走再回到同一炉次（ID 相同、代际已新）同样作废
 let getInFlight = false; // 当前代际的 GET 是否仍在途（此时禁用归档）
 let detailTargetId = null; // 当前代际 GET 所请求的炉次 ID
 let archivingIds = new Set(); // 已提交、尚未返回的归档请求所绑定的炉次 ID
@@ -924,15 +925,17 @@ async function loadDrafts() {
 }
 
 // 查看或刷新某炉次：一发起，旧详情立即失去归档资格；在最新 GET 成功
-// 读回前，归档按钮保持禁用。请求自带代际序号，旧请求（先看甲后看乙时
-// 晚返回的甲）的成功/失败/网络异常一律作废，不得改写当前详情。
+// 读回前，归档按钮保持禁用。请求自带代际序号：切走再回来（哪怕仍是同一
+// 炉次）后，旧 GET 与旧归档回包的成功/失败/网络异常一律按代际作废，不得
+// 改写当前详情，也不得再代为触发新的详情读取。
 async function openDraft(id, banner) {
   const seq = ++detailSeq;
   viewedDraft = null; // 旧详情即刻失去归档资格，哪怕请求还在途
   getInFlight = true;
   detailTargetId = id;
   // 注意：不清空 archivingIds。切到别的炉次时，甲已提交的归档照常生效；
-  // 同一炉次在归档返回前刷新，也仍受“不得重复提交”约束（按钮禁用）。
+  // 同一炉次在归档返回前刷新（或切走再回到该炉次），也仍受“不得重复提交”
+  // 约束（按钮禁用）；该旧归档回包到达时按代际作废，不再触发 GET。
 
   const card = draftDetailCard;
   card.hidden = false;
@@ -1050,62 +1053,73 @@ draftArchiveBtn.addEventListener("click", async () => {
   const targetVersion = viewedDraft.version;
   // 同一炉次归档未结束，不得重复提交（不同炉次各自独立）
   if (archivingIds.has(targetId)) return;
+  // 同时绑定点击这一刻的详情代际：此后无论是切走再回到甲、还是直接刷新
+  // 同一炉次，只要又发起过查看/刷新（detailSeq +1），本次旧回包即作废——
+  // 不得清空新详情、插入旧提示，也不得再代为触发一次详情 GET。
+  // 不变式：未发生新的查看/刷新时，当前选择必为 targetId，无需再比对 ID。
+  const clickSeq = detailSeq;
 
   draftDetailError.hidden = true;
   draftDetailOk.hidden = true;
   archivingIds.add(targetId);
   syncArchiveButton();
+  let r;
   try {
-    const r = await api(`/api/drafts/${targetId}/archive`, {
+    r = await api(`/api/drafts/${targetId}/archive`, {
       method: "POST",
       body: JSON.stringify({ version: targetVersion }),
     });
-    archivingIds.delete(targetId);
-
-    // 当前选择（含“该炉次详情仍在加载”的情形）。响应到达时用户已切到
-    // 别的炉次：甲的归档照常生效，但成功/失败/409/422/网络异常都不得
-    // 改写乙的详情、曲线、提示与按钮。
-    const currentId = getInFlight ? detailTargetId : (viewedDraft && viewedDraft.id);
-    if (currentId !== targetId) {
-      if (r.ok) loadDrafts(); // 后台静默同步列表状态即可
-      return;
-    }
-
-    if (r.status === 409) {
-      // 版本过期/已归档：刷新同一炉次，并保留可见原因
-      const cur = r.data.detail && r.data.detail.currentVersion;
-      const reason =
-        detailOf(r.data) + (cur ? ` 已为你重新载入当前版本 v${cur}。` : "");
-      await openDraft(targetId, { kind: "error", text: reason });
-      return;
-    }
-    if (!r.ok) {
-      // 422：当前无解等，状态未改变；刷新同一炉次，原因保留可见
-      await openDraft(targetId, {
-        kind: "error",
-        text: "归档失败（未改变任何状态）：" + detailOf(r.data),
-      });
-      return;
-    }
-    // 成功：冻结方案与提示一起显示，按钮保持“已归档”禁用
-    await openDraft(targetId, {
-      kind: "ok",
-      text: `归档成功：已冻结炉次 #${r.data.id} 的版本 v${r.data.version} 材料参数与完整求解结果；此后配方修改不再影响本炉次。`,
-    });
   } catch (e) {
     archivingIds.delete(targetId);
-    // 网络失败：不动详情，提示可重试（同一炉次并未归档成功）
-    const currentId = getInFlight ? detailTargetId : (viewedDraft && viewedDraft.id);
-    if (currentId === targetId) {
-      // 若该炉次详情仍在加载，提示由 GET 完成后呈现；此处仅恢复按钮资格
-      if (!getInFlight) {
-        draftDetailError.textContent =
-          "归档请求失败（网络异常），未改变任何状态，可重试归档。";
-        draftDetailError.hidden = false;
-      }
+    // 网络异常同样先看代际：切走再返回（或已刷新）后到达的异常不得干扰
+    // 当前详情；仅后台释放在途状态并恢复按钮资格。
+    if (clickSeq !== detailSeq) {
       syncArchiveButton();
+      return;
     }
+    // 网络失败：不动详情、不触发读取，仅提示可重试（同一炉次并未归档成功）。
+    // 若同代际内详情 GET 仍在加载，提示交给 GET 完成后呈现，这里只恢复按钮。
+    if (!getInFlight) {
+      draftDetailError.textContent =
+        "归档请求失败（网络异常），未改变任何状态，可重试归档。";
+      draftDetailError.hidden = false;
+    }
+    syncArchiveButton();
+    return;
   }
+  archivingIds.delete(targetId);
+
+  // 点击之后又发生过查看或刷新（含“切到乙再回到甲”——ID 相同但代际已新）：
+  // 旧归档回包（成功 / 409 / 422）一律作废，不改写当前详情、曲线、提示，
+  // 也不额外触发详情读取；仅在成功时后台静默同步列表，并按当前有效详情
+  // 恢复按钮。
+  if (clickSeq !== detailSeq) {
+    if (r.ok) loadDrafts();
+    syncArchiveButton();
+    return;
+  }
+
+  if (r.status === 409) {
+    // 版本过期/已归档：读回同一炉次，并保留可见原因（409 附当前版本号）
+    const cur = r.data.detail && r.data.detail.currentVersion;
+    const reason =
+      detailOf(r.data) + (cur ? ` 已为你重新载入当前版本 v${cur}。` : "");
+    await openDraft(targetId, { kind: "error", text: reason });
+    return;
+  }
+  if (!r.ok) {
+    // 422：当前无解等，状态未改变；读回同一炉次，原因保留可见
+    await openDraft(targetId, {
+      kind: "error",
+      text: "归档失败（未改变任何状态）：" + detailOf(r.data),
+    });
+    return;
+  }
+  // 成功：读回并显示冻结方案与成功提示，按钮保持“已归档”禁用
+  await openDraft(targetId, {
+    kind: "ok",
+    text: `归档成功：已冻结炉次 #${r.data.id} 的版本 v${r.data.version} 材料参数与完整求解结果；此后配方修改不再影响本炉次。`,
+  });
 });
 
 // ---------- 启动 ----------
