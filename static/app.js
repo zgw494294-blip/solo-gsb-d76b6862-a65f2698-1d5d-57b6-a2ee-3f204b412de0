@@ -1050,6 +1050,10 @@ draftArchiveBtn.addEventListener("click", async () => {
   const targetVersion = viewedDraft.version;
   // 同一炉次归档未结束，不得重复提交（不同炉次各自独立）
   if (archivingIds.has(targetId)) return;
+  // 记录点击时的详情代际：此后只要发生过任意“查看/刷新”（切到别的炉次、
+  // 手动刷新，或切走后再回到同一炉次），detailSeq 都会前进；该归档回包
+  // 到达时即按“过期回包”处理，不能只凭炉次 ID 判断归属。
+  const clickSeq = detailSeq;
 
   draftDetailError.hidden = true;
   draftDetailOk.hidden = true;
@@ -1062,12 +1066,13 @@ draftArchiveBtn.addEventListener("click", async () => {
     });
     archivingIds.delete(targetId);
 
-    // 当前选择（含“该炉次详情仍在加载”的情形）。响应到达时用户已切到
-    // 别的炉次：甲的归档照常生效，但成功/失败/409/422/网络异常都不得
-    // 改写乙的详情、曲线、提示与按钮。
-    const currentId = getInFlight ? detailTargetId : (viewedDraft && viewedDraft.id);
-    if (currentId !== targetId) {
-      if (r.ok) loadDrafts(); // 后台静默同步列表状态即可
+    // 点击后重新查看或刷新过（含“甲提交 → 切到乙 → 再回到甲”）：本回包
+    // 对当前详情区已过期。成功 / 409 / 422 均不得清空或改写当前详情、曲线、
+    // 提示，不得额外触发详情读取（也就不会让回到甲时的新 GET 因代际再增
+    // 而失效）；只释放该炉次的在途状态，按钮按当前有效详情恢复。
+    if (clickSeq !== detailSeq) {
+      if (r.ok) loadDrafts(); // 仅后台静默同步列表状态，不碰详情区
+      syncArchiveButton();
       return;
     }
 
@@ -1094,17 +1099,18 @@ draftArchiveBtn.addEventListener("click", async () => {
     });
   } catch (e) {
     archivingIds.delete(targetId);
-    // 网络失败：不动详情，提示可重试（同一炉次并未归档成功）
-    const currentId = getInFlight ? detailTargetId : (viewedDraft && viewedDraft.id);
-    if (currentId === targetId) {
-      // 若该炉次详情仍在加载，提示由 GET 完成后呈现；此处仅恢复按钮资格
-      if (!getInFlight) {
-        draftDetailError.textContent =
-          "归档请求失败（网络异常），未改变任何状态，可重试归档。";
-        draftDetailError.hidden = false;
-      }
+    // 网络失败：旧回包（点击后已重新查看/刷新过）只释放在途状态并恢复按钮，
+    // 不改写当前详情、提示，也不额外触发读取。
+    if (clickSeq !== detailSeq) {
       syncArchiveButton();
+      return;
     }
+    // 未离开当前视图：不动详情，提示可重试（同一炉次并未归档成功）。
+    // 代际未变时不可能仍有 GET 在途（查看/刷新才会推进代际）。
+    draftDetailError.textContent =
+      "归档请求失败（网络异常），未改变任何状态，可重试归档。";
+    draftDetailError.hidden = false;
+    syncArchiveButton();
   }
 });
 
